@@ -137,6 +137,20 @@ class UnrewindableBodyError(RequestException):
     """Requests encountered an error when trying to rewind a body."""
 
 
+class SSRFViolation(ConnectionError):
+    """A connection was blocked by SSRF protection.
+
+    Raised by :class:`~requests.adapters.SSRFProtectedHTTPAdapter` when the
+    resolved IP address of the target host falls within a blocked range (e.g.
+    loopback, RFC 1918 private ranges, link-local, or any range configured via
+    :class:`~requests.security.SSRFValidator`).
+
+    Inherits from :exc:`ConnectionError` so existing ``except ConnectionError``
+    handlers continue to work while still allowing callers to distinguish SSRF
+    blocks with a more specific ``except SSRFViolation``.
+    """
+
+
 # Warnings
 
 

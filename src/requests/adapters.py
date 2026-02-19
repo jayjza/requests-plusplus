@@ -44,6 +44,7 @@ from .exceptions import (
     ReadTimeout,
     RetryError,
     SSLError,
+    SSRFViolation,
 )
 from .models import Response
 from .structures import CaseInsensitiveDict
@@ -696,3 +697,145 @@ class HTTPAdapter(BaseAdapter):
                 raise
 
         return self.build_response(request, resp)
+
+
+class SSRFProtectedHTTPAdapter(HTTPAdapter):
+    """An :class:`HTTPAdapter` that blocks SSRF and DNS rebinding attacks.
+
+    Drop-in replacement for :class:`HTTPAdapter` that validates the IP address
+    of every outgoing connection — including connections made while following
+    redirects — against a configurable set of blocked IP ranges.  By default,
+    all private, loopback, link-local, and other RFC-reserved ranges are blocked
+    for both IPv4 and IPv6.
+
+    **DNS rebinding protection**: the hostname is resolved to an IP address
+    exactly once.  All resolved IPs are validated, and then the connection is
+    made directly to the validated sockaddr tuple without re-querying DNS.  This
+    means an attacker cannot change the DNS record between validation and connect.
+
+    **Proxy note**: when a proxy is configured, the IP that is validated is the
+    *proxy* server's IP, not the final target.  SSRF protection for the proxy-to-
+    target leg must be enforced by the proxy itself.
+
+    :param validator:
+        A pre-built :class:`~requests.security.SSRFValidator` instance.  If
+        provided, *blocked_ranges* and *allowed_ranges* are ignored.
+    :param blocked_ranges:
+        Iterable of :class:`~ipaddress.IPv4Network` / :class:`~ipaddress.IPv6Network`
+        objects to block.  Defaults to
+        :data:`~requests.security.DEFAULT_BLOCKED_RANGES` when *validator* is
+        ``None``.
+    :param allowed_ranges:
+        Networks explicitly permitted, overriding *blocked_ranges*.  Useful for
+        allowing a specific internal subnet while keeping the rest of RFC 1918
+        blocked::
+
+            from ipaddress import ip_network
+            adapter = SSRFProtectedHTTPAdapter(
+                allowed_ranges=[ip_network("10.0.1.0/24")],
+            )
+
+    All other keyword arguments are forwarded to :class:`HTTPAdapter`.
+
+    Usage — mount on both schemes so that redirects from https→http are also
+    protected::
+
+        import requests
+
+        session = requests.Session()
+        adapter = requests.SSRFProtectedHTTPAdapter()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        session.get("https://evil.internal/")  # raises SSRFViolation
+    """
+
+    __attrs__ = HTTPAdapter.__attrs__ + ["ssrf_validator"]
+
+    def __init__(
+        self,
+        *args: typing.Any,
+        validator: typing.Optional["SSRFValidator"] = None,  # type: ignore[name-defined]
+        blocked_ranges: typing.Optional[typing.Collection] = None,
+        allowed_ranges: typing.Optional[typing.Collection] = None,
+        **kwargs: typing.Any,
+    ) -> None:
+        # Import here so the socket patch in security.py is installed at the
+        # moment the first SSRFProtectedHTTPAdapter is constructed, not at
+        # import time of adapters.py (which would affect all requests globally).
+        from .security import SSRFValidator as _SSRFValidator
+
+        if validator is not None:
+            self.ssrf_validator = validator
+        else:
+            self.ssrf_validator = _SSRFValidator(
+                blocked_ranges=blocked_ranges,
+                allowed_ranges=allowed_ranges,
+            )
+
+        super().__init__(*args, **kwargs)
+
+    def __setstate__(self, state: dict) -> None:
+        # Ensure ssrf_validator survives pickling; fall back to default validator
+        # if the pickled state pre-dates this attribute.
+        from .security import SSRFValidator as _SSRFValidator
+
+        super().__setstate__(state)
+        if not hasattr(self, "ssrf_validator"):
+            self.ssrf_validator = _SSRFValidator()
+
+    def send(
+        self,
+        request,
+        stream: bool = False,
+        timeout=None,
+        verify=True,
+        cert=None,
+        proxies=None,
+    ):
+        """Send *request* with SSRF and DNS rebinding protection active.
+
+        Raises :exc:`~requests.exceptions.SSRFViolation` if the resolved IP of
+        the target (or any IP returned by DNS for the target hostname) falls
+        within a blocked range.
+        """
+        import ipaddress as _ipaddress
+
+        from .security import _SSRFViolationSignal, _ssrf_validator_local
+
+        # Fast-path check for URL-embedded IP literals (e.g. http://127.0.0.1/).
+        # This avoids setting up the thread-local only to fail immediately.
+        parsed = urlparse(request.url)
+        hostname = parsed.hostname
+        if hostname:
+            try:
+                _ip = _ipaddress.ip_address(hostname)
+                if self.ssrf_validator.is_ip_blocked(str(_ip)):
+                    raise SSRFViolation(
+                        f"Blocked connection to {hostname!r}: address is in a "
+                        f"reserved/private range.",
+                        request=request,
+                    )
+            except ValueError:
+                pass  # hostname is a domain name, not an IP literal
+
+        # Activate SSRF validation for this thread.  The patched urllib3
+        # create_connection reads this thread-local before opening any socket.
+        _ssrf_validator_local.validator = self.ssrf_validator
+        try:
+            return super().send(
+                request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+            )
+        except _SSRFViolationSignal as exc:
+            # Convert the low-level BaseException signal into the public
+            # requests exception type, attaching the PreparedRequest for context.
+            raise SSRFViolation(str(exc), request=request) from exc
+        finally:
+            # Always clear the thread-local so subsequent requests on this
+            # thread are not accidentally validated.
+            _ssrf_validator_local.validator = None

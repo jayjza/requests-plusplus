@@ -169,11 +169,14 @@ from .exceptions import (
     JSONDecodeError,
     ReadTimeout,
     RequestException,
+    SSRFViolation,
     Timeout,
     TooManyRedirects,
     URLRequired,
 )
+from .adapters import SSRFProtectedHTTPAdapter
 from .models import PreparedRequest, Request, Response
+from .security import DEFAULT_BLOCKED_RANGES, SSRFValidator
 from .sessions import Session, session
 from .status_codes import codes
 
